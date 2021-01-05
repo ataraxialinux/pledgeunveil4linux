@@ -1,51 +1,32 @@
+/*	$OpenBSD: kern_pledge.c,v 1.267 2020/10/29 21:15:27 denis Exp $	*/
+
+/*
+ * Copyright (c) 2015 Nicholas Marriott <nicm@openbsd.org>
+ * Copyright (c) 2015 Theo de Raadt <deraadt@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <seccomp.h>
 
-#define	SYS_MAXSYSCALL	313
-
-#define PLEDGE_ALWAYS	0xffffffffffffffffULL
-#define PLEDGE_RPATH	0x0000000000000001ULL	/* allow open for read */
-#define PLEDGE_WPATH	0x0000000000000002ULL	/* allow open for write */
-#define PLEDGE_CPATH	0x0000000000000004ULL	/* allow creat, mkdir, unlink etc */
-#define PLEDGE_STDIO	0x0000000000000008ULL	/* operate on own pid */
-#define PLEDGE_TMPPATH	0x0000000000000010ULL	/* for mk*temp() */
-#define PLEDGE_DNS	0x0000000000000020ULL	/* DNS services */
-#define PLEDGE_INET	0x0000000000000040ULL	/* AF_INET/AF_INET6 sockets */
-#define PLEDGE_FLOCK	0x0000000000000080ULL	/* file locking */
-#define PLEDGE_UNIX	0x0000000000000100ULL	/* AF_UNIX sockets */
-#define PLEDGE_ID	0x0000000000000200ULL	/* allow setuid, setgid, etc */
-#define PLEDGE_TAPE	0x0000000000000400ULL	/* Tape ioctl */
-#define PLEDGE_GETPW	0x0000000000000800ULL	/* YP enables if ypbind.lock */
-#define PLEDGE_PROC	0x0000000000001000ULL	/* fork, waitpid, etc */
-#define PLEDGE_SETTIME	0x0000000000002000ULL	/* able to set/adj time/freq */
-#define PLEDGE_FATTR	0x0000000000004000ULL	/* allow explicit file st_* mods */
-#define PLEDGE_PROTEXEC	0x0000000000008000ULL	/* allow use of PROT_EXEC */
-#define PLEDGE_TTY	0x0000000000010000ULL	/* tty setting */
-#define PLEDGE_SENDFD	0x0000000000020000ULL	/* AF_UNIX CMSG fd sending */
-#define PLEDGE_RECVFD	0x0000000000040000ULL	/* AF_UNIX CMSG fd receiving */
-#define PLEDGE_EXEC	0x0000000000080000ULL	/* execve, child is free of pledge */
-#define PLEDGE_ROUTE	0x0000000000100000ULL	/* routing lookups */
-#define PLEDGE_MCAST	0x0000000000200000ULL	/* multicast joins */
-#define PLEDGE_VMINFO	0x0000000000400000ULL	/* vminfo listings */
-#define PLEDGE_PS	0x0000000000800000ULL	/* ps listings */
-#define PLEDGE_DISKLABEL 0x0000000002000000ULL	/* disklabels */
-#define PLEDGE_PF	0x0000000004000000ULL	/* pf ioctls */
-#define PLEDGE_AUDIO	0x0000000008000000ULL	/* audio ioctls */
-#define PLEDGE_DPATH	0x0000000010000000ULL	/* mknod & mkfifo */
-#define PLEDGE_DRM	0x0000000020000000ULL	/* drm ioctls */
-#define PLEDGE_VMM	0x0000000040000000ULL	/* vmm ioctls */
-#define PLEDGE_CHOWN	0x0000000080000000ULL	/* chown(2) family */
-#define PLEDGE_CHOWNUID	0x0000000100000000ULL	/* allow owner/group changes */
-#define PLEDGE_BPF	0x0000000200000000ULL	/* bpf ioctl */
-#define PLEDGE_ERROR	0x0000000400000000ULL	/* ENOSYS instead of kill */
-#define PLEDGE_WROUTE	0x0000000800000000ULL	/* interface address ioctls */
-#define PLEDGE_UNVEIL	0x0000001000000000ULL	/* allow unveil() */
-#define PLEDGE_VIDEO	0x0000002000000000ULL	/* video ioctls */
-#define PLEDGE_YPACTIVE 0x8000000000000000ULL /* YP use detected and allowed */
+#include "pledge.h"
 
 /*
  * Ordered in blocks starting with least risky and most required.
@@ -313,16 +294,14 @@ pledgereq_flags(const char *req_name)
 		}
 	}
 
-	return 0;
+	return EINVAL;
 }
 
 int
-real_pledge(const char *promises)
+real_pledge(scmp_filter_ctx ctx, const char *promises, bool isexec)
 {
-	int f;
+	uint64_t f;
 	char *str, *token;
-
-	scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
 
 	if (promises == NULL)
 		return 1;
@@ -331,36 +310,61 @@ real_pledge(const char *promises)
 	token = strtok(str, " ");
 
 	while (token != NULL) {
-		f = pledgereq_flags(token);
-		switch (f) {
-			default:
-				fprintf(stderr, "not implemented\n");
-		}
+		if (pledgereq_flags(token) != 0)
+			return EINVAL;
+
+		f |= pledgereq_flags(token);
 		token = strtok(NULL, " ");
 	}
 
-	seccomp_load(ctx);
+	for (int i = 0; i < SYS_MAXSYSCALL; i++) {
+		if (pledge_syscalls[i] == 0)
+			continue;
+
+		if (!(pledge_syscalls[i] & f))
+			continue;
+
+#if 0
+		if (isexec == true) {
+			if ((seccomp_rule_add_exact(ctx, SCMP_ACT_ALLOW, SCMP_SYS(execve), 0)) != 0)
+				return EFAULT;
+		} else {
+			if ((seccomp_rule_add_exact(ctx, SCMP_ACT_ALLOW, i, 0)) != 0)
+				return EFAULT;
+		}
+#endif
+		if ((seccomp_rule_add_exact(ctx, SCMP_ACT_ALLOW, i, 0)) != 0)
+			return EFAULT;
+	}
 
 	return 0;
 }
 
-#if 0
 int
 pledge(const char *promises, const char *execpromises)
 {
-	real_pledge("stdio unix");
-	return 0;
-}
+	if (promises == NULL)
+		return EFAULT;
+
+	scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
+	if (ctx == NULL)
+		goto fail;
+
+	if(!(real_pledge(ctx, promises, false)) != 0)
+		goto fail;
+
+#if 0
+	if (execpromises != NULL && strstr(promises, "exec") != NULL)
+		if(!(real_pledge(ctx, execpromises, true)) != 0)
+			goto fail;
 #endif
 
-int
-main()
-{
-	pid_t pid;
+	if (!seccomp_load(ctx))
+		goto fail;
 
-	printf("no restrictions\n");
-	real_pledge("stdio unix");
-	pid = getpid ();
-	printf("restrictions, %d\n", pid);
+fail:
+	seccomp_release(ctx);
+	return EFAULT;
+
 	return 0;
 }

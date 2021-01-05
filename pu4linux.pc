@@ -1,0 +1,11 @@
+prefix=@prefix@
+exec_prefix=${prefix}
+includedir=@includedir@
+libdir=@libdir@
+
+Name: PU4Linux
+Description: pledge(2) and unveil(2) implementation for Linux
+URL: https://ataraxialinux.github.io/
+Version: 0.0.0
+Libs: -L${libdir} -lpu4linux -lseccomp
+Cflags: -I${includedir}

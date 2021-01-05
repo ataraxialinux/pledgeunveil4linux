@@ -47,10 +47,6 @@
 #define PLEDGE_VIDEO	0x0000002000000000ULL	/* video ioctls */
 #define PLEDGE_YPACTIVE 0x8000000000000000ULL /* YP use detected and allowed */
 
-#ifndef nitems
-#define nitems(_a) (sizeof((_a)) / sizeof((_a)[0]))
-#endif
-
 /*
  * Ordered in blocks starting with least risky and most required.
  */
